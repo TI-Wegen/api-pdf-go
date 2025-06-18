@@ -1,23 +1,35 @@
-FROM golang:1.24 AS builder
+FROM golang:1.24rc1 AS builder
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
+COPY go.mod ./
+COPY go.sum ./
 RUN go mod download
 
-COPY . .
+COPY . ./
 
-# Compila o binário
-RUN go build -o pdfscraping
+RUN CGO_ENABLED=0 GOOS=linux go build -o app ./main.go
 
-FROM mcr.microsoft.com/playwright:v1.52.0-jammy
+FROM debian:bullseye-slim
 
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN apt-get update && apt-get install -y \
+    chromium \
+    fonts-liberation \
+    libasound2 \
+    libnss3 \
+    libxss1 \
+    libxtst6 \
+    wget \
+    ca-certificates \
+    xdg-utils \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y ca-certificates
+ENV CHROME_PATH=/usr/bin/chromium
 
-COPY --from=builder /app/pdfscraping /app/pdfscraping
+WORKDIR /root/
+
+COPY --from=builder /app/app .
 
 EXPOSE 8080
 
-ENTRYPOINT ["/app/pdfscraping"]
+CMD ["./app"]

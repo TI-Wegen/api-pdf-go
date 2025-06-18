@@ -1,36 +1,52 @@
 package main
 
 import (
-	"log"
+	"context"
+	"errors"
+	"log/slog"
 	"net/http"
-
-	"github.com/gin-gonic/gin"
+	"os"
+	"os/signal"
+	"pdf.scraping.wegen/internal/converter"
+	"syscall"
+	"time"
 )
 
-type SetPdfRequest struct {
-	URL string `json:"url"`
-}
-
 func main() {
-	r := gin.Default()
-	pdfService := NewPdfScrapingService()
-	r.POST("/CreatePdfFromUrl", func(c *gin.Context) {
-		var req SetPdfRequest
-		if err := c.BindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
-			return
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	mux := http.NewServeMux()
+	converterHandler := converter.NewHandler(logger)
+	mux.HandleFunc("POST /CreatePdfFromUrl", converterHandler.HandleConvert)
+
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	go func() {
+		logger.Info("servidor escutando", "endereço", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("servidor encontrou um erro fatal", "erro", err)
+			os.Exit(1)
 		}
+	}()
 
-		pdfBytes, err := pdfService.GetPdfContent(req.URL)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
 
-		c.Data(http.StatusOK, "application/pdf", pdfBytes)
-	})
+	<-shutdownChan
+	logger.Info("sinal de desligamento recebido, iniciando graceful shutdown...")
 
-	if err := r.Run(); err != nil {
-		log.Fatal(err)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("falha no graceful shutdown", "erro", err)
+	} else {
+		logger.Info("servidor desligado com sucesso")
 	}
 }
