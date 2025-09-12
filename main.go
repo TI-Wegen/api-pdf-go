@@ -7,9 +7,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"pdf.scraping.wegen/internal/converter"
 	"syscall"
 	"time"
+
+	"github.com/TI-Wegen/api-pdf-go/internal/converter"
 )
 
 func main() {
