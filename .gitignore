@@ -1,0 +1,39 @@
+# Visual Studio / VS Code / JetBrains
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Binários e build do Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/app
+/api-pdf
+bin/
+dist/
+
+# Cobertura de testes
+coverage.*
+*.coverprofile
+
+# Dependências vendorizadas (descomente se não usar vendor)
+# vendor/
+
+# Ambiente e segredos
+.env
+.env.*
+
+# Sistema operacional
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs e PDFs gerados em testes locais
+*.log
+*.pdf

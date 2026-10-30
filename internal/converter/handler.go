@@ -3,89 +3,89 @@ package converter
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"time"
 
-	"github.com/chromedp/cdproto/page"
-	"github.com/chromedp/chromedp"
+	"github.com/TI-Wegen/api-pdf-go/internal/browser"
+	"github.com/TI-Wegen/api-pdf-go/internal/config"
 )
 
-type Request struct {
-	URL string `json:"url"`
-}
-
 type Handler struct {
-	log *slog.Logger
+	pool *browser.Pool
+	cfg  config.Config
+	log  *slog.Logger
 }
 
-func NewHandler(log *slog.Logger) *Handler {
-	return &Handler{
-		log: log,
-	}
+func NewHandler(pool *browser.Pool, cfg config.Config, log *slog.Logger) *Handler {
+	return &Handler{pool: pool, cfg: cfg, log: log}
 }
+
+// HandleConvert mantém o contrato original: POST /CreatePdfFromUrl {"url": "..."}.
 func (h *Handler) HandleConvert(w http.ResponseWriter, r *http.Request) {
-	var req Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.log.Warn("falha ao decodificar o corpo da requisição", "erro", err)
-		http.Error(w, "corpo da requisição inválido", http.StatusBadRequest)
-		return
-	}
-
-	if _, err := url.ParseRequestURI(req.URL); err != nil {
-		h.log.Warn("URL inválida recebida", "url", req.URL, "erro", err)
-		http.Error(w, "URL fornecida é inválida", http.StatusBadRequest)
-		return
-	}
-
-	h.log.Info("iniciando a conversão de URL para PDF", "url", req.URL)
-
-	pdfBuffer, err := h.generatePDF(r.Context(), req.URL)
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	siteURL, opts, err := parseURLRequest(r)
 	if err != nil {
-		h.log.Error("falha ao gerar o PDF", "url", req.URL, "erro", err)
-		http.Error(w, "erro interno ao gerar o PDF", http.StatusInternalServerError)
+		h.log.Warn("requisição de URL inválida", "erro", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	h.log.Info("conversão para PDF concluída com sucesso", "url", req.URL, "tamanho_bytes", len(pdfBuffer))
-
-	w.Header().Set("Content-Type", "application/pdf")
-	w.Header().Set("Content-Disposition", `attachment; filename="download.pdf"`)
-
-	if _, err := w.Write(pdfBuffer); err != nil {
-		h.log.Error("falha ao escrever a resposta em PDF", "erro", err)
-	}
+	h.convert(w, r, siteURL, "", opts)
 }
-func (h *Handler) generatePDF(ctx context.Context, siteURL string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	defer cancel()
 
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, chromedp.DefaultExecAllocatorOptions[:]...)
-	defer cancel()
-
-	taskCtx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(h.log.Info))
-	defer cancel()
-
-	var pdfBuffer []byte
-	err := chromedp.Run(taskCtx,
-		chromedp.Navigate(siteURL),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			buf, _, err := page.PrintToPDF().
-				WithPrintBackground(true).
-				Do(ctx)
-			if err != nil {
-				return err
-			}
-			pdfBuffer = buf
-			return nil
-		}),
-	)
-
+// HandleConvertHTML: POST /CreatePdfFromHtml com JSON {"html": "..."} ou corpo text/html.
+func (h *Handler) HandleConvertHTML(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxBodyBytes)
+	html, opts, err := parseHTMLRequest(r)
 	if err != nil {
-		return nil, fmt.Errorf("falha na execução das tarefas do chromedp: %w", err)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "HTML excede o tamanho máximo permitido", http.StatusRequestEntityTooLarge)
+			return
+		}
+		h.log.Warn("requisição de HTML inválida", "erro", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	h.convert(w, r, "", html, opts)
+}
+
+func (h *Handler) HandleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "emAndamento": h.pool.InFlight()})
+}
+
+func (h *Handler) convert(w http.ResponseWriter, r *http.Request, siteURL, html string, opts PdfOptions) {
+	start := time.Now()
+	origem := "html"
+	if siteURL != "" {
+		origem = siteURL
 	}
 
-	return pdfBuffer, nil
+	tab, release, err := h.pool.Acquire(r.Context())
+	if err != nil {
+		h.fail(w, origem, err)
+		return
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(tab, h.cfg.RenderTimeout)
+	defer cancel()
+	stop := context.AfterFunc(r.Context(), cancel) // cliente desconectou: aborta a renderização
+	defer stop()
+
+	out := newPdfWriter(w, opts.FileName)
+	if err := render(ctx, siteURL, html, opts, h.cfg.StreamChunkBytes, out); err != nil {
+		if !out.started {
+			h.fail(w, origem, err)
+			return
+		}
+		// Parte do PDF já foi enviada: derruba a conexão para o cliente
+		// não receber um arquivo truncado como se fosse válido.
+		h.log.Error("falha no meio do envio do PDF", "origem", origem, "erro", err)
+		panic(http.ErrAbortHandler)
+	}
+
+	h.log.Info("PDF gerado", "origem", origem, "bytes", out.written, "duracao_ms", time.Since(start).Milliseconds())
 }
